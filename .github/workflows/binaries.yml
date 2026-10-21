@@ -1,0 +1,99 @@
+name: Binaries
+
+# Pushing a tag bin-<sbcl version>-<build>, such as bin-2.6.9-1, builds that SBCL release from its source tarball
+# (versions/<version>.env) with the patches in patches/<version>/, and publishes it as a release of the tag.
+on:
+  push:
+    tags: ['bin-*']
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the tag
+        run: |
+          tag="$GITHUB_REF_NAME"
+          rest="${tag#bin-}"
+          version="${rest%-*}"
+          build="${rest##*-}"
+          if [ -z "$version" ] || [ "$version" = "$rest" ] || ! [ -f "versions/$version.env" ]; then
+            echo "::error::$tag does not name a version in versions/ as bin-<version>-<build>"
+            exit 1
+          fi
+          {
+            echo "SBCL_VERSION=$version"
+            echo "BUILD=$build"
+            echo "NAME=sbcl-$version-arm64-darwin-macos$MACOSX_DEPLOYMENT_TARGET"
+            cat "versions/$version.env"
+          } >> "$GITHUB_ENV"
+
+      - name: Download the source
+        run: |
+          curl -fsSL --retry 3 -o source.tar.bz2 "$SBCL_SOURCE_URL"
+          echo "$SBCL_SOURCE_SHA256  source.tar.bz2" | shasum -a 256 -c
+          tar -xjf source.tar.bz2
+          mv "sbcl-$SBCL_VERSION" "$NAME"
+
+      - name: Apply the patches
+        run: |
+          for p in patches/"$SBCL_VERSION"/*.patch; do
+            [ -e "$p" ] || continue
+            echo "applying $p"
+            patch -p1 -d "$NAME" < "$p"
+          done
+
+      - name: Install a host SBCL
+        run: brew install sbcl
+
+      - name: Build
+        working-directory: ${{ env.NAME }}
+        env:
+          SBCL_MAKE_JOBS: -j3
+        # No --with-sb-core-compression: the runtime then links only the system's libraries.
+        run: ./make.sh --with-sb-thread --xc-host='sbcl --dynamic-space-size 2GB --disable-debugger --no-userinit --no-sysinit'
+
+      - name: Check the runtime
+        run: ./check-darwin-runtime.sh "$NAME/src/runtime/sbcl" "$MACOSX_DEPLOYMENT_TARGET"
+
+      - name: Test
+        working-directory: ${{ env.NAME }}/tests
+        run: ./run-tests.sh
+
+      - name: Package
+        run: |
+          "$NAME/binary-distribution.sh" "$NAME"
+          bzip2 "$NAME-binary.tar"
+          shasum -a 256 "$NAME-binary.tar.bz2" > "$NAME-binary.tar.bz2.sha256"
+          cat "$NAME-binary.tar.bz2.sha256"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "SBCL $SBCL_VERSION for macOS $MACOSX_DEPLOYMENT_TARGET and later on arm64, build $BUILD."
+            echo
+            echo "Built from the release source tarball ($SBCL_SOURCE_URL, sha256 $SBCL_SOURCE_SHA256)"
+            echo "with \`--with-sb-thread\` and without core compression, so the runtime links only the system's"
+            echo "libraries. Patches applied:"
+            echo
+            found=0
+            for p in patches/"$SBCL_VERSION"/*.patch; do
+              [ -e "$p" ] || continue
+              echo "- \`$(basename "$p")\`"
+              found=1
+            done
+            [ "$found" = 1 ] || echo "- none"
+            echo
+            echo "Install with \`INSTALL_ROOT=<prefix> sh install.sh\` from the extracted directory."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$NAME-binary.tar.bz2" "$NAME-binary.tar.bz2.sha256" \
+            --title "SBCL $SBCL_VERSION, macOS $MACOSX_DEPLOYMENT_TARGET arm64 (build $BUILD)" --notes-file notes.md
